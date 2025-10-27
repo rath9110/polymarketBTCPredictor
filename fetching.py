@@ -2,36 +2,41 @@ import requests, pandas as pd, time
 from datetime import datetime
 import json
 
-url = "https://gamma-api.polymarket.com/markets"
-LIMIT   = 500
-params = {
-    "closed": "true",
-    "limit":  LIMIT,
-    "order": "endDate",
-    "ascending": "false"
+def get_btc_markets(pagination_offset):
+    url = "https://gamma-api.polymarket.com/markets"
+    LIMIT = 500
+    params = {
+        "closed": "true",
+        "limit":  LIMIT,
+        "order": "endDate",
+        "ascending": "false",
+        "category": "Crypto",
+        "offset": pagination_offset
+    }
 
-}
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    markets = response.json()
 
-response = requests.get(url, params=params, timeout=30)
-response.raise_for_status()
-markets = response.json()
+    KEYWORD = "bitcoin"
+
+    def match_keyword(m):
+        question = m.get("question").lower()
+        description = m.get("description").lower()
+        category = m.get("category")
+        return (KEYWORD.lower() in question) or (KEYWORD.lower() in description) and ("Crypto" in category) 
+
+    btc_markets= []
+    for m in markets:
+        if match_keyword(m):
+            btc_markets.append(m)
+        else:
+            continue
+    return btc_markets
+
+btc_markets = get_btc_markets(0)
 
 KEYWORD = "bitcoin"
-
-def match_keyword(m):
-    question = m.get("question").lower()
-    description = m.get("description").lower()
-    category = m.get("category")
-    return (KEYWORD.lower() in question) or (KEYWORD.lower() in description) and ("Crypto" in category) 
-
-btc_markets= []
-for m in markets:
-    if match_keyword(m):
-        print(btc_markets)
-        btc_markets.append(m)
-    else:
-        continue
-
 print(f"Found {len(btc_markets)} closed & resolved markets matching '{KEYWORD}'")
  
 def parse_token_ids(m):
@@ -43,8 +48,9 @@ def parse_token_ids(m):
     token_ids_unnested = json.loads(raw)
     return token_ids_unnested
 
-rows = []
+all_btc_markets = []
 for m in btc_markets:
+    market_title = m["question"]
     type(parse_token_ids(m))
     token_ids = parse_token_ids(m)
     if token_ids is None:
@@ -61,11 +67,21 @@ for m in btc_markets:
         continue
     if not no_price_history.ok:
         continue
-    yes_data = yes_price_history.json()
-    no_data  = no_price_history.json()
-    print(yes_data, no_data)
 
-    '''
+    yes_data = yes_price_history.json()["history"]
+    no_data  = no_price_history.json()["history"]
+    yes = pd.DataFrame(yes_data)
+    no = pd.DataFrame(no_data)
+
+    if "t" not in yes.columns or "t" not in no.columns:
+        #print(f"Skipping {market_title} missing 't' column in price history")
+        continue
+    merged_yes_no_df = yes.merge(no, on="t", suffixes=("_yes", "_no"))
+    merged_yes_no_df.head()
+    merged_yes_no_df['title'] = market_title
+    print(merged_yes_no_df.head())
+    
+'''    
     for pt in data:
         rows.append({
             "market_id": m["id"],
