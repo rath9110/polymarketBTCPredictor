@@ -181,10 +181,8 @@ for m in betting_markets:
     last_row = merged_outcomes_df.iloc[-1]
     final_winner = 0 if last_row["p_outcome_1"] > last_row["p_outcome_2"] else 1
 
-    # Convert datetime to pandas Timestamp for easier arithmetic
     merged_outcomes_df["datetime"] = pd.to_datetime(merged_outcomes_df["datetime"])
 
-    # Define the horizons we are testing
     horizons = {
         "4h": timedelta(hours=4),
         "12h": timedelta(hours=12),
