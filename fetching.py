@@ -123,13 +123,17 @@ def normalize_history_rows(rows):
 all_merged = []
 all_results = []
 processed = 0
-MAX_MARKETS = 50
+MAX_MARKETS = 350
 
 for m in betting_markets:
     if processed >= MAX_MARKETS:
         break
 
+    if processed == 100:
+        time.sleep(2)
+
     market_title = m.get("question") or "Untitled market"
+    print(f"Processing market: {market_title}")
 
     outcome_values = parse_outcomes(m)
     if not outcome_values or len(outcome_values) < 2:
