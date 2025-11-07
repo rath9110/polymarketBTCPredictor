@@ -1,56 +1,89 @@
-import requests, pandas as pd, time
-from datetime import datetime, timedelta
+import requests
+import pandas as pd
+from datetime import datetime, timedelta, timezone
 import math
 import json
 
-def get_betting_markets(keyword=None):
-    keyword = str(keyword or "").lower()
-    url = "https://gamma-api.polymarket.com/markets"
-    LIMIT = 500
-    if keyword == "":
-        params = {
-            "closed": "true",
-            "limit":  LIMIT,
-            "order": "endDate",
-            "ascending": "false"
-        }
-    else:
-        params = {
-            "closed": "true",
-            "limit":  LIMIT,
-            "order": "endDate",
-            "ascending": "false",
-            "search": keyword
-        }
+# --- Polymarket endpoints (official) ---
+URL_MARKETS = "https://gamma-api.polymarket.com/markets"
+URL_HISTORY = "https://clob.polymarket.com/prices-history"
 
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
-    markets = response.json()
+# --- Config ---
+LIMIT = 500
+MAX_MARKETS = 100
+FEE = 0.02  # 2% fee on net winnings
+LOOKBACK_DAYS = 30  # backtest window for markets that resolved within the last month
 
-    def match_keyword(m):
-        question = (m.get("question") or "").lower()
-        descrip_and_tion = (m.get("descrip_and_tion") or "").lower()
-        # category = m.get("category")
-        return (keyword in question) or (keyword in descrip_and_tion)
+# Horizons (labels -> timedeltas)
+HORIZONS = {
+    "30d": timedelta(days=10),
+    "5d": timedelta(days=5),
+}
 
-    betting_markets = []
+# Historical leader accuracy prior by horizon label (from your doc; tune as needed)
+HISTORICAL_ACCURACY = {
+    "10d": 0.91,
+    "5d": 0.95,
+}
+
+def logit(p: float) -> float:
+    return math.log(p / (1 - p))
+
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+def calculate_blended_probability(q_market: float, horizon_label: str, lam: float = 0.5) -> float:
+    """
+    Blend market-implied probability with historical leader accuracy (in log-odds space).
+    lam in [0,1]: weight toward the historical prior.
+    """
+    q_market = min(max(q_market, 1e-6), 1 - 1e-6)
+    a = HISTORICAL_ACCURACY.get(horizon_label, 0.91)
+    a = min(max(a, 1e-6), 1 - 1e-6)
+    return sigmoid((1 - lam) * logit(q_market) + lam * logit(a))
+
+def get_betting_markets(keyword: str | None = None):
+    """
+    Fetch closed markets from Polymarket and filter to those that ended in the last LOOKBACK_DAYS.
+    All time handling in UTC.
+    """
+    params = {
+        "closed": "true",
+        "limit": LIMIT,
+        "order": "endDate",
+        "ascending": "false",
+        "search": keyword or "",
+    }
+    r = requests.get(URL_MARKETS, params=params, timeout=30)
+    r.raise_for_status()
+    markets = r.json()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+
+    def parse_end_dt(m):
+        # gamma markets often include "endDate" as ISO8601
+        end_raw = m.get("endDate") or m.get("endTime") or m.get("end_time")
+        if not end_raw:
+            return None
+        try:
+            # Force parse as UTC if no offset present
+            dt = pd.to_datetime(end_raw, utc=True).to_pydatetime()
+            return dt
+        except Exception:
+            return None
+
+    filtered = []
     for m in markets:
-        if match_keyword(m):
-            betting_markets.append(m)
-        else:
+        dt = parse_end_dt(m)
+        if dt is None:
             continue
-    return betting_markets
+        if dt >= cutoff:
+            filtered.append(m)
 
-betting_markets = get_betting_markets()
+    return filtered
 
-KEYWORD = "bitcoin"
-
-def parse_token_ids(m):
-    """
-    clobTokenIds may already be a list of strings, or a JSON-encoded string.
-    Do NOT join and json.loads the concatenation—just load if string, pass-through if list.
-    """
-    token_ids = m.get("clobTokenIds")
+def parse_token_ids(market):
+    token_ids = market.get("clobTokenIds")
     if token_ids is None:
         return None
     if isinstance(token_ids, list):
@@ -58,178 +91,138 @@ def parse_token_ids(m):
     if isinstance(token_ids, str):
         try:
             return json.loads(token_ids)
-        except Excep_and_tion:
+        except Exception:
             return None
     return None
 
-def parse_outcomes(m):
-    outs = m.get("outcomes")
-    if outs is None:
-        return None
-    if isinstance(outs, list):
-        return outs
-    if isinstance(outs, str):
-        try:
-            return json.loads(outs)
-        except Excep_and_tion:
-            return None
-    return None
-
-def fetch_history_any(token_id):
+def fetch_history_any(token_id: str):
     """
-    Try multiple intervals/endpoints since 'interval=max' often returns emp_and_ty:
-    1) interval=all
-    2) no interval
-    3) interval=max (last)
-    Return a list of dicts (possibly emp_and_ty).
+    Fetch full price history for an outcome token.
     """
-    url = "https://clob.polymarket.com/prices-history"
-
-    r = requests.get(url, params={"market": token_id, "interval": "all"}, timeout=30)
+    r = requests.get(URL_HISTORY, params={"market": token_id, "interval": "all"}, timeout=30)
     if r.ok:
-        data = (r.json() or {}).get("history") or []
-        if data:
-            return data
-
-    r = requests.get(url, params={"market": token_id}, timeout=30)
-    if r.ok:
-        data = (r.json() or {}).get("history") or []
-        if data:
-            return data
-
-    r = requests.get(url, params={"market": token_id, "interval": "max"}, timeout=30)
-    if r.ok:
-        data = (r.json() or {}).get("history") or []
-        if data:
-            return data
+        return (r.json() or {}).get("history") or []
     return []
 
 def normalize_history_rows(rows):
     """
-    Ensure each row has 't' and 'p' keys.
-    Some responses may use 'timestamp' or 'time'; map them to 't'.
+    Normalize to {'t': <unix_seconds>, 'p': <price>} and convert to UTC-aware datetime.
     """
     norm = []
-    for p_and_t in rows or []:
-        if isinstance(p_and_t, dict):
-            t = p_and_t.get("t")
-            if t is None:
-                t = p_and_t.get("timestamp", p_and_t.get("time"))
-            p = p_and_t.get("p")
-            if t is not None and p is not None:
-                norm.append({"t": t, "p": p})
+    for e in rows or []:
+        if not isinstance(e, dict):
+            continue
+        t = e.get("t") or e.get("timestamp") or e.get("time")
+        p = e.get("p")
+        if t is None or p is None:
+            continue
+        # Many Polymarket histories use Unix seconds. Treat as UTC.
+        try:
+            ts = pd.to_datetime(int(t), unit="s", utc=True)  # UTC-aware
+        except Exception:
+            # Fallback: let pandas infer, force utc
+            ts = pd.to_datetime(t, utc=True, errors="coerce")
+        if pd.isna(ts):
+            continue
+        norm.append({"ts": ts, "p": float(p)})
+    print(norm)
     return norm
 
-all_merged = []
-all_results = []
-processed = 0
-MAX_MARKETS = 350
+best_ev_descriptive = []
 
-for m in betting_markets:
-    if processed >= MAX_MARKETS:
-        break
+def backtest():
+    markets = get_betting_markets()
+    all_results = []
 
-    if processed == 100:
-        time.sleep(2)
+    for idx, m in enumerate(markets):
+        if idx >= MAX_MARKETS:
+            break
 
-    market_title = m.get("question") or "Untitled market"
-    print(f"Processing market: {market_title}")
+        title = (m.get("question") or "").strip() or "Untitled market"
+        token_ids = parse_token_ids(m)
+        if not token_ids or len(token_ids) < 2:
+            continue
 
-    outcome_values = parse_outcomes(m)
-    if not outcome_values or len(outcome_values) < 2:
-        # print(f"Skipping {market_title} — outcomes not binary or missing")
-        continue
-    outcome_values_1 = outcome_values[0]
-    outcome_values_2 = outcome_values[1]
+        # Outcome price histories
+        h1 = normalize_history_rows(fetch_history_any(token_ids[0]))
+        h2 = normalize_history_rows(fetch_history_any(token_ids[1]))
+        if not h1 or not h2:
+            continue
 
-    token_ids = parse_token_ids(m)
-    if not token_ids or len(token_ids) < 2:
-        # print(f"Skipping {market_title} — no/invalid clobTokenIds")
-        continue
+        df1 = pd.DataFrame(h1)
+        df2 = pd.DataFrame(h2)
 
-    outcome_1_token = token_ids[0]
-    outcome_2_token = token_ids[1]
+        # Merge on UTC timestamps
+        merged = pd.merge(df1, df2, on="ts", how="inner", suffixes=("_o1", "_o2"))
+        if merged.empty:
+            continue
 
-    outcome_1_raw = fetch_history_any(outcome_1_token)
-    outcome_2_raw = fetch_history_any(outcome_2_token)
+        # Sort by time just in case
+        merged = merged.sort_values("ts").reset_index(drop=True)
 
-    if not outcome_1_raw and not outcome_2_raw:
-        # print(f"Skipping {market_title} — no CLOB price history available")
-        continue
+        # For each horizon, snapshot at (final_ts - delta) in UTC
+        final_ts = merged["ts"].iloc[-1]  # tz-aware UTC
+        for h_label, delta in HORIZONS.items():
+            target_ts = final_ts - delta
 
-    outcome_1_data = normalize_history_rows(outcome_1_raw)
-    outcome_2_data = normalize_history_rows(outcome_2_raw)
+            # Choose last observation at or BEFORE target_ts (all UTC-aware)
+            mask = merged["ts"] <= target_ts
+            if not mask.any():
+                continue
+            snap = merged.loc[mask].iloc[-1]
 
-    outcome_1 = pd.DataFrame(outcome_1_data)
-    outcome_2 = pd.DataFrame(outcome_2_data)
+            p1 = float(snap["p_o1"])
+            p2 = float(snap["p_o2"])
 
-    if "t" not in outcome_1.columns or "t" not in outcome_2.columns:
-        # print(f"Skipping {market_title} missing 't' column in price history")
-        continue
+            # Leader side = higher price at snapshot
+            leader_q = max(p1, p2)
+            underdog_q = min(p1, p2)
 
-    merged_outcomes_df = outcome_1.merge(outcome_2, on="t", suffixes=("_outcome_1", "_outcome_2"))
+            # Blend leader probability toward historical leader accuracy
+            p_blend = calculate_blended_probability(leader_q, h_label, lam=0.5)
 
-    if merged_outcomes_df.empty:
-        continue
+            # EV after fees for leader and underdog (treated analogously)
+            ev_leader = p_blend * (1 - FEE) - leader_q
+            ev_underdog = (1 - p_blend) * (1 - FEE) - (1 - leader_q)
 
-    merged_outcomes_df["title"] = market_title
-    merged_outcomes_df["datetime"] = merged_outcomes_df["t"].apply(lambda x: datetime.fromtimestamp(x).isoformat())
-    merged_outcomes_df["outcome_value_1"] = outcome_values_1
-    merged_outcomes_df["outcome_value_2"] = outcome_values_2
-    merged_outcomes_df = merged_outcomes_df.drop(["t"], axis=1)
+            best_side = "leader" if ev_leader >= ev_underdog else "underdog"
+            best_ev = max(ev_leader, ev_underdog)
 
-    all_merged.append((merged_outcomes_df))
-    processed += 1
+            print(best_ev)
 
-    # Determine final winner based on last price
-    last_row = merged_outcomes_df.iloc[-1]
-    final_winner = 0 if last_row["p_outcome_1"] > last_row["p_outcome_2"] else 1
+            all_results.append({
+                "market": title,
+                "horizon": h_label,
+                "snapshot_ts_utc": snap["ts"],  # tz-aware UTC
+                "leader_price": leader_q,
+                "underdog_price": underdog_q,
+                "p_blend": p_blend,
+                "ev_leader": ev_leader,
+                "ev_underdog": ev_underdog,
+                "best_side": best_side,
+                "best_ev": best_ev,
+            })
 
-    merged_outcomes_df["datetime"] = pd.to_datetime(merged_outcomes_df["datetime"])
+    if not all_results:
+        print("No qualifying snapshots found in the last 30 days.")
+        return
 
-    horizons = {
-        "4h": timedelta(hours=4),
-        "12h": timedelta(hours=12),
-        "24h": timedelta(hours=24),
-        "1w": timedelta(weeks=1),
-        "1m": timedelta(days=30)
-    }
+    results_df = pd.DataFrame(all_results)
+    # Quick rollup
+    summary = (
+        results_df
+        .groupby("horizon")["best_ev"]
+        .agg(["count", "mean", "median"])
+        .rename(columns={"count": "trades", "mean": "avg_EV", "median": "med_EV"})
+        .sort_index()
+    )
 
-    accuracy_records = []
+    print("Backtest summary (UTC throughout):")
+    print(summary)
+    print(results_df["best_ev"].describe())
+    
+    # Optionally return the detailed frame for inspection
+    return results_df, summary
 
-    final_time = merged_outcomes_df["datetime"].iloc[-1]
-
-    for label, delta in horizons.items():
-        target_time = final_time - delta
-
-        # Find closest timestamp *before* or equal to the target time
-        df_before = merged_outcomes_df[merged_outcomes_df["datetime"] <= target_time]
-
-        if df_before.empty:
-            continue  # Not enough history to evaluate this horizon
-
-        snapshot = df_before.iloc[-1]  # most recent value before target_time
-
-        prediction = 0 if snapshot["p_outcome_1"] > snapshot["p_outcome_2"] else 1
-
-        accuracy_records.append({
-            "market": market_title,
-            "horizon": label,
-            "prediction": prediction,
-            "final_winner": final_winner,
-            "correct": int(prediction == final_winner)
-        })
-
-    # Append these to a global list so we can compute aggregate accuracy later
-    all_results.extend(accuracy_records)
-
-results_df = pd.DataFrame(all_results)
-
-summary = (
-    results_df.groupby("horizon")["correct"]
-    .agg(["sum", "count"])
-    .rename(columns={"sum": "correct", "count": "total"})
-)
-summary["accuracy"] = summary["correct"] / summary["total"]
-
-print(summary)
+if __name__ == "__main__":
+    detailed, summary = backtest()
